@@ -76,6 +76,28 @@ CREATE INDEX IF NOT EXISTS idx_hp_participant_window
 -- 幂等重放与审计，且不阻止该 key 被重新申请。
 CREATE UNIQUE INDEX IF NOT EXISTS idx_holds_hold_key_pending
     ON reservation_holds (hold_key) WHERE status = 'pending';
+CREATE TABLE IF NOT EXISTS reservation_waitlist (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    request_id       TEXT NOT NULL UNIQUE,  -- 客户端幂等请求标识（与正式预约共用同一 request_id 命名空间）
+    start_utc        TEXT NOT NULL,
+    end_utc          TEXT NOT NULL,
+    participants_key TEXT NOT NULL,    -- 规范化参与者列表（去重排序后的 JSON）
+    status           TEXT NOT NULL DEFAULT 'pending',  -- pending=候补中；promoted=已转正式预约
+    reservation_id   INTEGER REFERENCES reservations(id),  -- promoted 后指向正式预约
+    created_at       TEXT NOT NULL,    -- 入队时刻（FIFO 排序键；与 id 共同保证严格先后）
+    promoted_at      TEXT              -- 转为正式预约的时刻；pending 为 NULL
+);
+CREATE TABLE IF NOT EXISTS reservation_waitlist_participants (
+    waitlist_id    INTEGER NOT NULL REFERENCES reservation_waitlist(id) ON DELETE CASCADE,
+    participant_id TEXT NOT NULL,
+    start_utc      TEXT NOT NULL,
+    end_utc        TEXT NOT NULL,
+    PRIMARY KEY (waitlist_id, participant_id)
+);
+-- 候补参与者行仅用于取消事务内按“受影响参与者 + 时段”快速 FIFO 扫描；
+-- 候补不占位，故不参与任何冲突检查。
+CREATE INDEX IF NOT EXISTS idx_wp_participant_window
+    ON reservation_waitlist_participants (participant_id, start_utc, end_utc);
 """
 
 _init_lock = threading.Lock()
@@ -116,6 +138,10 @@ def init_db(db_path: str | None = None) -> None:
       64 个 0，快照如实记录迁移初始化时观测到的预约状态（含历史
       version/status/canceled_at），事件时间取迁移时刻——不伪造过去的
       创建/改期/取消操作。重复执行幂等（已有事件的预约不会重复补写）。
+    - ``reservation_holds`` / ``reservation_hold_participants`` 与
+      ``reservation_waitlist`` / ``reservation_waitlist_participants``
+      均以 ``CREATE TABLE IF NOT EXISTS`` 无损建立：不改动任何既有
+      预约/事件数据，建表幂等可重复执行。
     """
     path = db_path or get_db_path()
     with _init_lock:

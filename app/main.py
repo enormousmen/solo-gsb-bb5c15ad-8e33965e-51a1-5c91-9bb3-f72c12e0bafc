@@ -16,11 +16,16 @@ from . import db as db_module
 from . import holds as hold_core
 from . import reservations as reservation_core
 from . import scheduling
+from . import waitlist as waitlist_core
 from .audit import CANON_FMT as _AUDIT_CANON_FMT, ChainVerificationError
 from .holds import (
     HoldExpiredError,
     HoldKeyConflictError,
     HoldNotFoundError,
+)
+from .waitlist import (
+    WaitlistContentConflictError,
+    WaitlistNotFoundError,
 )
 from .reservations import (
     RequestIdConflictError,
@@ -43,6 +48,8 @@ from .schemas import (
     ReservationIn,
     ReservationOut,
     ReservationRescheduleIn,
+    ReservationWaitlistIn,
+    ReservationWaitlistOut,
     SegmentOut,
     WEEKDAY_NAMES,
 )
@@ -71,8 +78,12 @@ app = FastAPI(
         "与进行中预约及其他未过期保留在 BEGIN IMMEDIATE 事务内按半开区间检查冲突，"
         "到期保留在事务内惰性过期；未过期 pending 保留可确认为正式预约"
         "（同事务写入并追加 created 审计事件），重复确认幂等返回同一预约。"
+        "另提供预约候补队列（reservation waitlist）：时段当前可预约则直接创建"
+        "正式预约，否则按创建时间进入 pending 队列（相同 request_id 幂等）；"
+        "取消正式预约时在同一 BEGIN IMMEDIATE 事务内按 FIFO 扫描受影响候补，"
+        "跳过仍冲突项，把首个可满足项原子转为正式预约并写入现有哈希链审计。"
     ),
-    version="1.5.0",
+    version="1.6.0",
     lifespan=lifespan,
 )
 
@@ -124,6 +135,21 @@ async def hold_key_conflict_handler(request, exc: HoldKeyConflictError) -> JSONR
     return JSONResponse(
         status_code=409,
         content={"detail": str(exc), "existing_hold_id": exc.hold_id},
+    )
+
+
+@app.exception_handler(WaitlistNotFoundError)
+async def waitlist_not_found_handler(request, exc: WaitlistNotFoundError) -> JSONResponse:
+    return JSONResponse(status_code=404, content={"detail": str(exc)})
+
+
+@app.exception_handler(WaitlistContentConflictError)
+async def waitlist_content_conflict_handler(
+    request, exc: WaitlistContentConflictError
+) -> JSONResponse:
+    return JSONResponse(
+        status_code=409,
+        content={"detail": str(exc), "existing_waitlist_id": exc.waitlist_id},
     )
 
 
@@ -455,3 +481,79 @@ def confirm_reservation_hold(
     if not confirmed:
         response.status_code = 200
     return _reservation_to_out(reservation)
+
+
+# ------------------------------------------------------ reservation waitlist
+
+
+def _waitlist_to_out(
+    entry: waitlist_core.WaitlistEntry,
+    reservation: reservation_core.Reservation | None,
+) -> ReservationWaitlistOut:
+    return ReservationWaitlistOut(
+        waitlist_id=entry.id,
+        request_id=entry.request_id,
+        start_utc=_iso_z(entry.start_utc),
+        end_utc=_iso_z(entry.end_utc),
+        participants=list(entry.participants),
+        created_at=_iso_z(entry.created_at),
+        status=entry.status,
+        reservation=_reservation_to_out(reservation)
+        if reservation is not None else None,
+        promoted_at=_iso_z(entry.promoted_at)
+        if entry.promoted_at is not None else None,
+    )
+
+
+@app.post(
+    "/api/v1/reservation-waitlist",
+    response_model=ReservationWaitlistOut,
+    status_code=201,
+)
+def join_reservation_waitlist(
+    req: ReservationWaitlistIn, response: Response
+) -> ReservationWaitlistOut:
+    """加入预约候补队列：当前可预约则直接创建正式预约，否则按创建时间排队。
+
+    整个“惰性过期 + 判定 + 写入”在单个 ``BEGIN IMMEDIATE`` 事务内完成：
+
+    - 请求时段与**进行中预约**及**未过期 pending 保留**均无半开区间重叠
+      → ``201`` 直接创建正式预约（同事务写入并追加 ``created`` 哈希链审计
+      事件），候补行状态为 ``promoted`` 并关联该预约；
+    - 否则不报错：``201`` 写入 ``pending`` 候补行（``created_at`` 即
+      FIFO 排序键）。pending 候补**不占位**，不会阻止任何预约/保留/改期；
+    - 相同 ``request_id`` + 相同规范化内容（起止、去重排序参与者）重试
+      → ``200`` 返回候补当前状态（仍 pending，或已 promoted 及关联预约，
+      含该预约后续改期/取消后的最新状态）；同 ``request_id`` 内容不同
+      → ``409``；该 ``request_id`` 已被其他正式预约/候补占用且内容不同
+      同样 ``409``。
+
+    候补在被取消预约释放出时段后，由取消事务按 FIFO 自动晋升
+    （见 ``DELETE /api/v1/reservations/{id}``）。
+    """
+    result = waitlist_core.join_waitlist(
+        request_id=req.request_id,
+        start_utc=req.start_utc,
+        end_utc=req.end_utc,
+        participant_ids=req.participant_ids,
+    )
+    if not result.inserted:
+        # 幂等重放 / 跨端点同内容：返回已有候补/预约
+        response.status_code = 200
+    return _waitlist_to_out(result.entry, result.reservation)
+
+
+@app.get(
+    "/api/v1/reservation-waitlist/{request_id}",
+    response_model=ReservationWaitlistOut,
+)
+def get_reservation_waitlist(request_id: str) -> ReservationWaitlistOut:
+    """查询候补状态：``pending`` 候补中或 ``promoted`` 已转正式预约。
+
+    - ``request_id`` 从未通过候补接口登记 → ``404``；
+    - ``pending`` → ``200``，``reservation`` 为 ``null``；
+    - ``promoted`` → ``200``，``reservation`` 为关联正式预约的**当前最新
+      状态**（晋升后可正常改期/取消），``promoted_at`` 为晋升时刻。
+    """
+    entry, reservation = waitlist_core.get_waitlist_entry(request_id)
+    return _waitlist_to_out(entry, reservation)

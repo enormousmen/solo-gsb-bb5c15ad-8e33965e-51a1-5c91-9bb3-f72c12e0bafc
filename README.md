@@ -3,7 +3,7 @@
 基于 **Python + FastAPI + 标准库 `zoneinfo`** 的会议候选时段聚合服务，
 并附带 **SQLite 持久化的会议预约接口**（幂等创建、乐观锁版本改期、
 软删除取消、单事务冲突检测、**可校验的 SHA-256 哈希链变更历史**、
-**预约临时保留 / 确认**）。
+**预约临时保留 / 确认**、**预约候补队列**）。
 
 每位参与者按**本地星期与钟面时刻**填写每周重复的可用区间并给出 IANA 时区
 （如 `Asia/Shanghai`），服务按具体日期应用夏令时（DST）规则，统一换算到 UTC，
@@ -33,13 +33,14 @@
 ```
 app/
   scheduling.py    # 聚合核心：本地时刻换算、跨午夜拆分、扫描线、排序
-  reservations.py  # 预约核心：规范化、幂等创建、乐观锁版本改期/取消、单事务冲突检测、历史读取
+  reservations.py  # 预约核心：规范化、幂等创建、乐观锁版本改期/取消、单事务冲突检测、历史读取、取消后 FIFO 候补晋升
   holds.py         # 临时保留核心：TTL 占位、事务内惰性过期、确认转正式预约
+  waitlist.py      # 候补核心：可预约直订/否则入队、request_id 幂等、取消事务内 FIFO 扫描晋升
   audit.py         # 审计事件：canonical JSON、SHA-256 哈希链追加与整链重验
   db.py            # SQLite 连接管理、建表与无损迁移（补列 / 补 baseline 事件）
   schemas.py       # Pydantic 请求/响应模型
   main.py          # FastAPI 路由
-tests/             # pytest 测试（DST、跨午夜、排序、预约冲突/幂等/并发、临时保留、哈希链/篡改/迁移）
+tests/             # pytest 测试（DST、跨午夜、排序、预约冲突/幂等/并发、临时保留、候补 FIFO 晋升、哈希链/篡改/迁移）
 Dockerfile
 docker-compose.yml
 requirements.txt  # 运行依赖
@@ -75,6 +76,9 @@ docker compose up --build
 升级到带**临时保留**的版本后，`reservation_holds` 与
 `reservation_hold_participants` 两张新表以 `CREATE TABLE IF NOT EXISTS`
 无损建立：不改动任何既有预约/事件数据，建表幂等可重复执行。
+升级到带**候补队列**的版本后，`reservation_waitlist` 与
+`reservation_waitlist_participants` 两张新表同样以
+`CREATE TABLE IF NOT EXISTS` 幂等无损建立，不影响任何既有数据。
 
 服务启动后访问 <http://localhost:8000>（Swagger UI 在 <http://localhost:8000/docs>）。
 若 8000 端口被占用：
@@ -349,6 +353,12 @@ curl -s -X PUT http://localhost:8000/api/v1/reservations/1 \
 - 成功 → `200`：`status` 置为 `canceled`、记录 `canceled_at`、`version` 加 `1`，
   并**同事务删除全部参与者占用**——时段提交后立即可被再次预约；
   预约行本身保留（软删除），`request_id`、`created_at` 等不变。
+- **候补晋升**：删除占用、追加 `canceled` 事件后，在**同一 `BEGIN IMMEDIATE`
+  事务**内按 FIFO（`created_at, id`）扫描与被取消预约“参与者相交且时段重叠”的
+  pending 候补，**跳过仍与其他进行中预约或未过期保留冲突的项**，把首个可满足
+  候补原子转为正式预约（同事务写入并追加 `created` 哈希链事件）；
+  一次取消至多晋升一条候补，无候补可满足则不晋升（详见
+  [预约候补队列](#post-apiv1reservation-waitlist)）。
 - **幂等重试**：相同 `reservation_id` + 原 `expected_version` 重试 → `200`
   返回**同一取消结果**（同样的 `canceled_at` 与版本），不重复变更；
   取消后使用其他版本号 → `409` + `current_version`。
@@ -516,6 +526,130 @@ curl -s -X POST http://localhost:8000/api/v1/reservation-holds/1/confirm \
 确认产生的正式预约与直接创建的完全等价：可正常 `GET .../history`
 验链（首条事件为 `created`）、`PUT` 改期、`DELETE` 取消。
 
+### `POST /api/v1/reservation-waitlist`
+
+加入**预约候补队列**：时段当前可预约则直接创建正式预约，否则按创建时间进入
+pending 队列（不报错、不占位）。请求体与创建预约完全一致：
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `request_id` | 非空字符串（≤200） | 客户端幂等请求标识；**与正式预约/候补共用同一命名空间** |
+| `start_utc` / `end_utc` | ISO 8601（须带时区偏移，如 `...Z`） | UTC 起止时刻；`end_utc` 必须晚于 `start_utc` |
+| `participant_ids` | 非空字符串数组 | 参与者 ID；**去重并排序后**存储 |
+
+语义（整个“惰性过期 + 判定 + 写入”在单个 `BEGIN IMMEDIATE` 事务内完成）：
+
+- **当前可预约**（与进行中预约及未过期 pending 保留均无半开区间重叠）
+  → `201` **直接创建正式预约**：同事务写入预约、参与者占用与 **`created`
+  哈希链审计事件**，候补行状态直接为 `promoted` 并关联该预约；
+- **当前被占用** → `201` 写入 `pending` 候补行，`created_at` 即 FIFO 排序键。
+  pending 候补**不占位**：不会阻止任何人的正式预约、临时保留或改期；
+  候补之间也互不冲突（同一时段可有多条候补，按创建时间排队）；
+- **幂等**：相同 `request_id` + 相同规范化内容重试 → `200` 返回候补当前状态
+  （仍为 `pending`，或已 `promoted` 及关联预约的**最新状态**，含晋升后又被
+  改期/取消的结果）；相同 `request_id` 但内容不同 → `409`。
+  该 `request_id` 已被正式预约（`POST /reservations` 或保留确认）占用时：
+  同内容 `200` 幂等返回该预约（候补行回填为 `promoted`），不同内容 `409`；
+  反过来，pending 候补占用的 `request_id` 也不能被内容不同的正式预约/保留确认
+  使用（同样 `409`，响应给出 `existing_waitlist_id`）。
+
+请求示例：
+
+```bash
+curl -s -X POST http://localhost:8000/api/v1/reservation-waitlist \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "request_id": "req-wait-1",
+    "start_utc": "2026-03-09T13:00:00Z",
+    "end_utc": "2026-03-09T14:00:00Z",
+    "participant_ids": ["alice", "bob"]
+  }'
+```
+
+当前可预约时（`201`，直接成为正式预约）：
+
+```json
+{
+  "waitlist_id": 1,
+  "request_id": "req-wait-1",
+  "start_utc": "2026-03-09T13:00:00Z",
+  "end_utc": "2026-03-09T14:00:00Z",
+  "participants": ["alice", "bob"],
+  "created_at": "2026-09-18T09:10:00.123456Z",
+  "status": "promoted",
+  "reservation": {
+    "reservation_id": 1,
+    "request_id": "req-wait-1",
+    "start_utc": "2026-03-09T13:00:00Z",
+    "end_utc": "2026-03-09T14:00:00Z",
+    "participants": ["alice", "bob"],
+    "version": 1,
+    "status": "active",
+    "canceled_at": null,
+    "created_at": "2026-09-18T09:10:00.123456Z"
+  },
+  "promoted_at": "2026-09-18T09:10:00.123456Z"
+}
+```
+
+时段被占用时（`201`，进入 pending 队列，`reservation` 为 `null`）：
+
+```json
+{
+  "waitlist_id": 2,
+  "request_id": "req-wait-2",
+  "start_utc": "2026-03-09T13:00:00Z",
+  "end_utc": "2026-03-09T14:00:00Z",
+  "participants": ["alice", "bob"],
+  "created_at": "2026-09-18T09:11:20.654321Z",
+  "status": "pending",
+  "reservation": null,
+  "promoted_at": null
+}
+```
+
+同 `request_id` 内容不同（`409`）：
+
+```json
+{
+  "detail": "request_id is already used by reservation waitlist entry #2 with different content",
+  "existing_waitlist_id": 2
+}
+```
+
+其他错误：`422`（`end_utc` 不晚于 `start_utc`、时间缺时区偏移、参与者/`request_id` 为空等）。
+
+### `GET /api/v1/reservation-waitlist/{request_id}`
+
+查询候补状态及其关联预约：
+
+- `request_id` 从未通过候补接口登记 → `404`；
+- `pending` → `200`，`reservation` 为 `null`；
+- `promoted` → `200`，`reservation` 为关联正式预约的**当前最新状态**
+  （晋升后仍可正常改期/取消，查询始终反映最新版本），`promoted_at` 为晋升时刻。
+
+```bash
+curl -s http://localhost:8000/api/v1/reservation-waitlist/req-wait-2
+```
+
+取消正式预约后的自动晋升规则（见
+[DELETE 预约](#delete-apiv1reservationsreservation_id)）：
+
+1. 仅扫描与被取消预约**至少一位参与者相同**且候补时段与其时段
+   **半开重叠**（`existing.start < new.end` 且 `new.start < existing.end`，
+   首尾相接不算受影响）的 pending 候补；
+2. 按 **FIFO**（`created_at` 升序，相同则按候补 id 升序）依次检查；
+3. 候选项若仍与**其他进行中预约**或**未过期 pending 保留**重叠 →
+   **跳过该项**继续向后扫描；
+4. **首个**不再冲突的候选项在同一 `BEGIN IMMEDIATE` 事务内原子转为正式预约
+   （写入预约、参与者占用并追加现有 `created` 哈希链事件；候补行置为
+   `promoted` 并回填 `reservation_id` / `promoted_at`），随后立即停止——
+   一次取消至多晋升一条；无候选或全部仍冲突则不晋升。
+5. 版本不符等失败取消整体回滚，候补不发生任何变化；原 `expected_version`
+   的取消幂等重试不会重复晋升。
+6. 候补只在**取消**时触发晋升（改期不触发）；晋升后的预约与普通创建完全等价
+   （可验链、改期、再次取消——再次取消时同样会尝试晋升后续候补）。
+
 ### `GET /api/v1/reservations/{reservation_id}/history`
 
 返回预约的**可校验变更历史**：按序（`seq` 升序）列出审计事件，服务端在返回前
@@ -650,6 +784,16 @@ for ev in history["events"]:
   `request_id` 撞车 409 且可在 TTL 内换键重试、确认后临时占用行释放；
   并发保留仅一个赢家、并发确认只产生一条预约与一条事件；
   旧版库初始化无损新建保留表且既有数据不动。
+- **候补队列（waitlist）**：空闲时段直订 201 为 promoted 且同事务写入
+  `created` 事件、被占用则 201 入 pending 且不占位（不阻止预约/保留/改期、
+  候补之间不冲突）；同 `request_id` 幂等重放 200（pending / promoted 均返回
+  最新状态）、同键异内容 409、GET 404/最新预约状态（含晋升后改期/取消）；
+  取消在同一事务内按 `(created_at, id)` FIFO 晋升**受影响**候补（参与者相交
+  + 时段半开重叠，相邻不扫描）、跳过仍与其他预约/未过期保留冲突的项、
+  一次取消至多晋升一条、晋升与取消同事务原子（版本不符回滚、幂等重试不重复
+  晋升）、晋升产生的预约可正常验链/改期/再取消；跨端点 `request_id` 一致
+  （直接预约/保留确认与候补互相识别同内容幂等、异内容 409）；并发入队与
+  并发取消下恰好一个赢家；旧版库初始化无损新建候补表、迁移幂等。
 
 ```bash
 pytest -q

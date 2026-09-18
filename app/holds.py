@@ -305,6 +305,20 @@ def confirm_hold(
             if existing is not None:
                 raise RequestIdConflictError(existing["id"])
 
+            # request_id 命名空间与候补队列共用：pending 候补若已占用该键，
+            # 内容不同 → 409；内容相同则由本次确认兑现（下方回填为 promoted）。
+            from . import waitlist as waitlist_core
+            wl_row = conn.execute(
+                "SELECT id, start_utc, end_utc, participants_key, status"
+                " FROM reservation_waitlist WHERE request_id = ?",
+                (request_id,),
+            ).fetchone()
+            if wl_row is not None and wl_row["status"] == "pending":
+                if not (wl_row["start_utc"] == row["start_utc"]
+                        and wl_row["end_utc"] == row["end_utc"]
+                        and wl_row["participants_key"] == row["participants_key"]):
+                    raise waitlist_core.WaitlistContentConflictError(wl_row["id"])
+
             participants = tuple(json.loads(row["participants_key"]))
             reservation_id = insert_reservation(
                 conn,
@@ -314,6 +328,11 @@ def confirm_hold(
                 participants=participants,
                 now_s=now_s,
             )
+            # 同 request_id 的 pending 候补由本次确认兑现：原子回填为 promoted
+            if wl_row is not None:
+                waitlist_core.mark_promoted(
+                    conn, waitlist_id=wl_row["id"],
+                    reservation_id=reservation_id, now_s=now_s)
             conn.execute(
                 "UPDATE reservation_holds"
                 " SET status = 'confirmed', reservation_id = ?, confirmed_at = ?"

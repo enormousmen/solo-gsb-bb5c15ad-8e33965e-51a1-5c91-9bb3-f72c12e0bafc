@@ -194,6 +194,20 @@ class ReservationHoldConfirmIn(BaseModel):
     )
 
 
+class ReservationWaitlistIn(_ReservationWindowBase):
+    """候补请求：幂等 request_id + 半开区间参与者占用；冲突时排队而非报错。"""
+
+    request_id: str = Field(
+        min_length=1, max_length=200,
+        description=(
+            "客户端幂等请求标识（与正式预约共用同一命名空间）："
+            "时段当前可预约则直接创建正式预约，否则按创建时间进入 pending 队列；"
+            "相同标识 + 相同规范化内容重试返回当前候补状态"
+        ),
+        examples=["req-wait-1"],
+    )
+
+
 class ReservationHoldOut(BaseModel):
     hold_id: int
     hold_key: str
@@ -231,6 +245,31 @@ class ReservationOut(BaseModel):
         examples=[None],
     )
     created_at: str
+
+
+class ReservationWaitlistOut(BaseModel):
+    """候补请求状态（pending 候补中 / promoted 已转正式预约）。"""
+
+    waitlist_id: int
+    request_id: str
+    start_utc: str = Field(description="UTC 开始时间 ISO 8601", examples=["2026-03-09T13:00:00Z"])
+    end_utc: str
+    participants: list[str] = Field(description="参与者 id，去重后按字典序排列")
+    created_at: str = Field(
+        description="入队时刻（UTC ISO 8601），即候补 FIFO 排序键",
+    )
+    status: Literal["pending", "promoted"] = Field(
+        description="候补状态：pending=候补中；promoted=已转为正式预约",
+        examples=["pending"],
+    )
+    reservation: ReservationOut | None = Field(
+        default=None,
+        description="promoted 后关联的正式预约（含其当前最新状态）；pending 为 null",
+    )
+    promoted_at: str | None = Field(
+        default=None,
+        description="转为正式预约的时刻（UTC ISO 8601）；pending 为 null",
+    )
 
 
 class HistoryEventOut(BaseModel):

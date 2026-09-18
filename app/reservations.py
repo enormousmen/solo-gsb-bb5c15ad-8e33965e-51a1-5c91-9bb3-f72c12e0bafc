@@ -298,6 +298,20 @@ def create_reservation(
                     return _row_to_reservation(row), False
                 raise RequestIdConflictError(row["id"])
 
+            # request_id 命名空间与候补队列共用：pending 候补若已占用该键，
+            # 内容不同 → 409（同内容的预订由候补晋升路径接管，见 waitlist.join）。
+            from . import waitlist as waitlist_core
+            wl_row = conn.execute(
+                "SELECT id, start_utc, end_utc, participants_key, status"
+                " FROM reservation_waitlist WHERE request_id = ?",
+                (request_id,),
+            ).fetchone()
+            if wl_row is not None and wl_row["status"] == "pending":
+                if not (wl_row["start_utc"] == start_s
+                        and wl_row["end_utc"] == end_s
+                        and wl_row["participants_key"] == participants_key):
+                    raise waitlist_core.WaitlistContentConflictError(wl_row["id"])
+
             conflicts = collect_reservation_conflicts(
                 conn, participants, start_s, end_s)
             conflicts.extend(_collect_hold_conflicts(
@@ -313,6 +327,11 @@ def create_reservation(
                 participants=participants,
                 now_s=now_s,
             )
+            # 同 request_id 的 pending 候补由本次直订兑现：原子回填为 promoted
+            if wl_row is not None:
+                waitlist_core.mark_promoted(
+                    conn, waitlist_id=wl_row["id"],
+                    reservation_id=reservation_id, now_s=now_s)
             conn.execute("COMMIT")
             return Reservation(
                 id=reservation_id,
@@ -479,14 +498,24 @@ def cancel_reservation(
        ``version`` 加 1，并**删除全部参与者占用行**——时段在同一事务
        提交后立即可被他人预约；预约行本身保留（软删除），此后改期
        请求一律 409，不会复活。
+    5. 释放占用后，在**同一事务**内按 FIFO 扫描受释放时段影响的候补队列
+       （``reservation_waitlist``）：跳过仍与其他进行中预约或未过期保留
+       冲突的候选项，把首个可满足项原子转为正式预约（复用正式预约写入，
+       并追加现有 ``created`` 哈希链审计事件）。无可满足候补则不晋升。
     """
     path = db.ensure_initialized(db_path)
     conn = db.connect(path)
     try:
         # BEGIN IMMEDIATE：与创建/改期路径一致，事务开始即持写锁，
-        # “存在性 + 状态 + 版本校验 + 取消 + 释放占用” 对并发请求原子。
+        # “存在性 + 状态 + 版本校验 + 取消 + 释放占用 + 候补晋升”
+        # 对并发请求原子。
         conn.execute("BEGIN IMMEDIATE")
         try:
+            now_s = _canon(datetime.now(timezone.utc))
+            # 事务入口惰性过期到期保留：随后的候补晋升冲突检查只面对
+            # 有效占用，到期保留腾出的时段可被晋升立即利用
+            _expire_due_holds(conn, now_s)
+
             row = conn.execute(
                 f"SELECT {_RESERVATION_COLUMNS} FROM reservations WHERE id = ?",
                 (reservation_id,),
@@ -506,7 +535,10 @@ def cancel_reservation(
             if expected_version != current_version:
                 raise VersionConflictError(reservation_id, current_version)
 
-            now_s = _canon(datetime.now(timezone.utc))
+            canceled_participants = tuple(
+                json.loads(row["participants_key"]))
+            canceled_start_s = row["start_utc"]
+            canceled_end_s = row["end_utc"]
             conn.execute(
                 "UPDATE reservations"
                 " SET status = 'canceled', canceled_at = ?, version = version + 1"
@@ -538,6 +570,18 @@ def cancel_reservation(
                 action="canceled",
                 timestamp=now_s,
                 snapshot=snapshot,
+            )
+            # 取消与释放占用已在本事务完成（占用行已删除，其他事务在本事务
+            # 提交前无法看到中间状态）：同事务按 FIFO 扫描受影响候补，
+            # 跳过仍冲突项，把首个可满足项原子转为正式预约（其 created
+            # 审计事件与取消事件同事务提交，同生共死）。
+            from . import waitlist as waitlist_core
+            waitlist_core.promote_from_waitlist(
+                conn,
+                participants=canceled_participants,
+                start_s=canceled_start_s,
+                end_s=canceled_end_s,
+                now_s=now_s,
             )
             conn.execute("COMMIT")
             return Reservation(
