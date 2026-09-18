@@ -298,6 +298,17 @@ def create_reservation(
                     return _row_to_reservation(row), False
                 raise RequestIdConflictError(row["id"])
 
+            # request_id 已被候补队列占用（pending 或 promoted）：
+            # 不允许被直接创建路径另作他用——否则取消递补时会撞
+            # reservations.request_id 唯一约束（递补路径本身会防御性跳过）。
+            waitlist_hit = conn.execute(
+                "SELECT id FROM reservation_waitlist WHERE request_id = ?",
+                (request_id,),
+            ).fetchone()
+            if waitlist_hit is not None:
+                # promoted 候补关联的预约已在上方命中；此处命中的是 pending 候补
+                raise RequestIdConflictError(waitlist_hit["id"])
+
             conflicts = collect_reservation_conflicts(
                 conn, participants, start_s, end_s)
             conflicts.extend(_collect_hold_conflicts(
@@ -478,7 +489,11 @@ def cancel_reservation(
     4. 否则执行取消：``status`` 置为 ``canceled``、记录 ``canceled_at``、
        ``version`` 加 1，并**删除全部参与者占用行**——时段在同一事务
        提交后立即可被他人预约；预约行本身保留（软删除），此后改期
-       请求一律 409，不会复活。
+       请求一律 409，不会复活；
+    5. **候补递补**（仅本次实际执行取消时）：在同一事务内按 FIFO 扫描
+       受影响候补（见 :mod:`app.waitlist`），跳过仍冲突项，把首个可
+       满足项原子转为正式预约并追加 ``created`` 审计事件；幂等重试
+       取消走步骤 2 的提前返回，不会再次递补。
     """
     path = db.ensure_initialized(db_path)
     conn = db.connect(path)
@@ -487,6 +502,10 @@ def cancel_reservation(
         # “存在性 + 状态 + 版本校验 + 取消 + 释放占用” 对并发请求原子。
         conn.execute("BEGIN IMMEDIATE")
         try:
+            now_s = _canon(datetime.now(timezone.utc))
+            # 事务入口惰性过期到期保留：随后的候补递补冲突检查只面对有效占用
+            _expire_due_holds(conn, now_s)
+
             row = conn.execute(
                 f"SELECT {_RESERVATION_COLUMNS} FROM reservations WHERE id = ?",
                 (reservation_id,),
@@ -506,7 +525,7 @@ def cancel_reservation(
             if expected_version != current_version:
                 raise VersionConflictError(reservation_id, current_version)
 
-            now_s = _canon(datetime.now(timezone.utc))
+            canceled_participants = tuple(json.loads(row["participants_key"]))
             conn.execute(
                 "UPDATE reservations"
                 " SET status = 'canceled', canceled_at = ?, version = version + 1"
@@ -526,7 +545,7 @@ def cancel_reservation(
                 request_id=row["request_id"],
                 start_utc=row["start_utc"],
                 end_utc=row["end_utc"],
-                participants=json.loads(row["participants_key"]),
+                participants=canceled_participants,
                 version=current_version + 1,
                 status="canceled",
                 canceled_at=now_s,
@@ -539,13 +558,24 @@ def cancel_reservation(
                 timestamp=now_s,
                 snapshot=snapshot,
             )
+            # 同一事务内 FIFO 扫描受影响候补并递补首个可满足项：
+            # 取消释放占用、新预约写入与其 created 审计事件同生共死；
+            # 惰性导入避免与 waitlist 模块的模块级导入形成循环。
+            from . import waitlist as waitlist_core
+            waitlist_core.promote_affected_waitlist(
+                conn,
+                canceled_start_s=row["start_utc"],
+                canceled_end_s=row["end_utc"],
+                canceled_participants=canceled_participants,
+                now_s=now_s,
+            )
             conn.execute("COMMIT")
             return Reservation(
                 id=reservation_id,
                 request_id=row["request_id"],
                 start_utc=_parse(row["start_utc"]),
                 end_utc=_parse(row["end_utc"]),
-                participants=tuple(json.loads(row["participants_key"])),
+                participants=canceled_participants,
                 created_at=_parse(row["created_at"]),
                 version=current_version + 1,
                 status="canceled",

@@ -194,6 +194,45 @@ class ReservationHoldConfirmIn(BaseModel):
     )
 
 
+class ReservationWaitlistIn(_ReservationWindowBase):
+    """候补入队请求：幂等 request_id + 与正式预约同口径的时间/参与者。"""
+
+    request_id: str = Field(
+        min_length=1, max_length=200,
+        description=(
+            "客户端幂等请求标识：相同标识 + 相同规范化内容重试返回原候补行"
+            "（pending 或已 promoted 的关联预约）；标识相同但内容不同返回 409"
+        ),
+        examples=["req-wait-1"],
+    )
+
+
+class ReservationWaitlistOut(BaseModel):
+    """候补条目输出：pending=候补中；promoted=已转正式预约（带关联预约）。"""
+
+    waitlist_id: int
+    request_id: str
+    start_utc: str = Field(description="UTC 开始时间 ISO 8601", examples=["2026-03-09T13:00:00Z"])
+    end_utc: str
+    participants: list[str] = Field(description="参与者 id，去重后按字典序排列")
+    status: Literal["pending", "promoted"] = Field(
+        description=(
+            "候补状态：pending=仍在队列等待；promoted=已原子转为正式预约"
+            "（入队时即可约，或后续取消递补）"
+        ),
+        examples=["pending"],
+    )
+    reservation: ReservationOut | None = Field(
+        default=None,
+        description="promoted 时关联的正式预约完整信息；pending 为 null",
+    )
+    created_at: str = Field(description="入队时刻 ISO 8601；FIFO 顺序以此为准")
+    promoted_at: str | None = Field(
+        default=None,
+        description="转为正式预约的时刻 ISO 8601；pending 为 null",
+    )
+
+
 class ReservationHoldOut(BaseModel):
     hold_id: int
     hold_key: str
